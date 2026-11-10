@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Quản lý cửa hàng</title>
+<link rel="stylesheet" href="/vendor/bootstrap/css/bootstrap.min.css"><link rel="stylesheet" href="/vendor/icons/bootstrap-icons.min.css"><link rel="stylesheet" href="/css/style.css"></head>
+<body><main class="container py-3" style="max-width:900px">
+<div id="view"></div>
+</main>
+<div class="tabs-bottom noprint">
+  <button data-t="orders" class="active"><i class="bi bi-receipt"></i>Đơn hàng</button>
+  <button data-t="products"><i class="bi bi-basket"></i>Sản phẩm</button>
+  <button data-t="profile"><i class="bi bi-shop"></i>Hồ sơ & QR</button>
+</div>
+<script src="/vendor/bootstrap/js/bootstrap.bundle.min.js"></script>
+<script src="/socket.io/socket.io.js"></script>
+<script src="/js/common.js"></script>
+<script src="/js/dashboard.js"></script></body></html>
