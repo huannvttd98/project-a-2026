@@ -22,11 +22,12 @@
           h('div', {}, h('div', { class: 'fw-bold' }, o.shop ? o.shop.name : ''),
             h('small', { class: 'text-muted' }, fmtTime(o.created_at) + ' · #' + o.code.slice(0, 8))),
           badge(o.status)),
+        h('div', { class: 'small my-1' }, icon('clock'), ' ', deliverText(o)),
         progress(o.status),
         h('ul', { class: 'list-unstyled small mb-2' }, o.items.map(i => h('li', { class: 'd-flex justify-content-between' },
-          h('span', {}, `${i.name} × ${i.qty}`), h('span', {}, money(Math.round(i.price * i.qty)))))),
+          h('span', {}, `${i.name} × ${i.qty}`), h('span', {}, i.price === null ? 'Chờ xác nhận giá' : money(Math.round(i.price * i.qty)))))),
         h('div', { class: 'd-flex justify-content-between align-items-center' },
-          h('div', {}, 'Tổng: ', h('span', { class: 'price' }, money(o.total)), h('small', { class: 'text-muted' }, ' (COD)')),
+          h('div', {}, h('span', { class: 'price' }, orderTotal(o)), h('small', { class: 'text-muted' }, ' (COD)')),
           o.status === 'new' && h('button', {
             class: 'btn btn-outline-danger btn-sm',
             onclick: async () => {
@@ -48,4 +49,5 @@
     toast(`Đơn #${code.slice(0, 8)}: ${STATUS[status]}`);
   });
   socket.on('connect', load);
+  socket.on('order:updated', load);
 })();

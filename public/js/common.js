@@ -26,7 +26,11 @@ function h(tag, attrs, ...children) {
 const $ = (s, r = document) => r.querySelector(s);
 const icon = n => h('i', { class: 'bi bi-' + n });
 const money = n => new Intl.NumberFormat('vi-VN').format(n) + 'đ';
+const productPrice = price => price === null ? 'Liên hệ' : money(price);
+const orderTotal = o => o.price_pending ? `Tạm tính ${money(o.total)} · Chờ xác nhận giá` : `Tổng: ${money(o.total)}`;
 const fmtTime = s => new Date(s.replace(' ', 'T') + 'Z').toLocaleString('vi-VN');
+const fmtIso = s => new Date(s).toLocaleString('vi-VN', { weekday: 'short', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+const deliverText = o => (o.deliver_at ? 'Giao lúc ' + fmtIso(o.deliver_at) : 'Giao sớm nhất');
 const badge = s => h('span', { class: `badge rounded-pill text-bg-${STATUS_COLOR[s] || 'secondary'}` }, STATUS[s] || s);
 
 async function api(method, url, body) {

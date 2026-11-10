@@ -10,14 +10,34 @@
   }
 
   function render() {
-    fields.replaceChildren(
+    fields.replaceChildren(...[
       mode === 'shop' && field('shopName', 'Tên cửa hàng', 'text', { maxlength: 100 }),
       mode !== 'login' && field('name', mode === 'shop' ? 'Tên chủ cửa hàng' : 'Họ tên', 'text', { maxlength: 80 }),
       field('phone', 'Số điện thoại', 'tel', { pattern: '0[0-9]{9,10}', placeholder: '0912345678', autocomplete: 'username' }),
       field('password', 'Mật khẩu', 'password', {
         minlength: mode === 'login' ? 1 : 8, autocomplete: mode === 'login' ? 'current-password' : 'new-password',
       }),
-    );
+    ].filter(Boolean));
+    if (mode === 'login') {
+      $('#phone').addEventListener('input', e => {
+        e.target.value = e.target.value.replace(/\s/g, '');
+      });
+      const password = $('#password');
+      const group = h('div', { class: 'input-group' });
+      const toggle = h('button', {
+        type: 'button', class: 'btn btn-outline-secondary',
+        'aria-label': 'Hiển thị mật khẩu', 'aria-pressed': 'false', 'aria-controls': 'password',
+        onclick: () => {
+          const visible = password.type === 'password';
+          password.type = visible ? 'text' : 'password';
+          toggle.setAttribute('aria-label', visible ? 'Ẩn mật khẩu' : 'Hiển thị mật khẩu');
+          toggle.setAttribute('aria-pressed', String(visible));
+          toggle.replaceChildren(icon(visible ? 'eye-slash' : 'eye'));
+        },
+      }, icon('eye'));
+      password.before(group);
+      group.append(password, toggle);
+    }
     $('#submit').textContent = labels[mode];
     $('#title').textContent = labels[mode];
     $('#err').textContent = '';

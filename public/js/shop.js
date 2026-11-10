@@ -2,15 +2,17 @@
   const user = await initNav();
   const slug = new URLSearchParams(location.search).get('s');
   const CART_KEY = 'cart:' + slug;
-  let shop, products = [];
+  const CAT_EMOJI = { 'Rau lá': '🥬', 'Củ quả': '🥕', 'Trái cây': '🍓', 'Gạo & ngũ cốc': '🌾', 'Trứng & sữa': '🥚', 'Nấm': '🍄', 'Gia vị & thảo mộc': '🌶️' };
+  let shop, products = [], categories = [];
   let cart = {};
   let activeCat = null;
+  const draft = { customer_name: user ? user.name : '', phone: user ? user.phone : '', address: '', note: '', deliver_at: '' };
   try { cart = JSON.parse(localStorage.getItem(CART_KEY) || '{}'); } catch { cart = {}; }
   const saveCart = () => localStorage.setItem(CART_KEY, JSON.stringify(cart));
 
   async function load() {
     try {
-      ({ shop, products } = await api('GET', '/api/shops/' + encodeURIComponent(slug)));
+      ({ shop, products, categories } = await api('GET', '/api/shops/' + encodeURIComponent(slug)));
     } catch (e) {
       $('main').replaceChildren(h('div', { class: 'alert alert-warning' }, e.message));
       return false;
@@ -25,10 +27,13 @@
       h('div', { class: 'd-flex gap-3 align-items-start' },
         shop.logo_url ? h('img', { class: 'hero-logo', src: shop.logo_url, alt: '' }) : h('div', { class: 'hero-logo d-flex align-items-center justify-content-center bg-white fs-3' }, '🌿'),
         h('div', { class: 'flex-grow-1' },
-          h('h1', { class: 'h4 mb-1' }, shop.name),
+          h('h1', { class: 'h4 mb-1' }, shop.name, ' ',
+            h('span', { class: 'badge align-middle fs-6 text-bg-' + (shop.accepting_orders ? 'success' : 'secondary') }, shop.accepting_orders ? 'Đang mở' : 'Tạm đóng')),
           h('div', {}, shop.description),
           h('div', { class: 'small text-muted' }, icon('geo-alt'), ' ', shop.address || '—'),
-          h('div', { class: 'small text-muted' }, icon('clock'), ' ', shop.open_hours || '—'))),
+          h('div', { class: 'small text-muted' }, icon('clock'), ' ', shop.open_hours || '—'),
+          h('div', { class: 'small text-muted' }, icon('truck'), ` Chuẩn bị ~${shop.prep_minutes} phút`,
+            shop.min_order > 0 && ` · Đơn tối thiểu ${money(shop.min_order)}`))),
       h('div', { class: 'd-flex flex-wrap gap-2 mt-3' },
         phone && h('a', { class: 'btn btn-success', href: 'tel:' + phone }, icon('telephone'), ' Gọi ', phone),
         shop.zalo && h('a', { class: 'btn btn-outline-success', href: 'https://zalo.me/' + shop.zalo, target: '_blank', rel: 'noopener noreferrer' }, icon('chat-dots'), ' Zalo'),
@@ -42,7 +47,7 @@
   }
 
   function renderMenu() {
-    const cats = [...new Set(products.map(p => p.category))];
+    const cats = categories.filter(c => products.some(p => p.category === c));
     if (activeCat && !cats.includes(activeCat)) activeCat = null;
     $('#chips').replaceChildren(...['Tất cả', ...cats].map(c => {
       const on = (c === 'Tất cả' && !activeCat) || c === activeCat;
@@ -50,21 +55,41 @@
     }));
     const menu = $('#menu');
     menu.replaceChildren();
-    const shown = products.filter(p => !activeCat || p.category === activeCat);
+    const shown = products.filter(p => !activeCat || p.category === activeCat)
+      .sort((a, b) => categories.indexOf(a.category) - categories.indexOf(b.category));
     if (!shown.length) menu.append(h('p', { class: 'text-muted mt-3' }, 'Cửa hàng chưa có sản phẩm.'));
     menu.append(h('div', { class: 'row g-2 g-md-3 mt-1' }, shown.map(p =>
       h('div', { class: 'col-6 col-md-4' },
         h('div', { class: 'card h-100' },
-          p.image ? h('img', { class: 'thumb w-100', src: p.image, alt: '', loading: 'lazy' }) : h('div', { class: 'thumb-ph' }, '🥕'),
+          p.image ? h('img', { class: 'thumb w-100', src: p.image, alt: '', loading: 'lazy' }) : h('div', { class: 'thumb-ph' }, CAT_EMOJI[p.category] || '🥕'),
           h('div', { class: 'card-body d-flex flex-column p-2 p-md-3' },
             h('div', { class: 'fw-semibold' }, p.name),
-            h('div', { class: 'price mb-2' }, money(p.price), h('small', { class: 'text-muted fw-normal' }, ' / ' + p.unit)),
+            h('div', { class: 'price mb-2' }, productPrice(p.price), h('small', { class: 'text-muted fw-normal' }, ' / ' + p.unit)),
             h('div', { class: 'mt-auto' }, p.available
               ? h('button', { class: 'btn btn-success btn-sm w-100', onclick: () => add(p.id) }, icon('cart-plus'), ' Thêm')
               : h('span', { class: 'badge text-bg-secondary' }, 'Hết hàng'))))))));
   }
 
   function add(id) { cart[id] = Math.min(99, (cart[id] || 0) + 1); saveCart(); renderCart(); toast('Đã thêm vào giỏ'); }
+
+  // Các mốc giao hàng mỗi 30 phút (06:00–21:00), bắt đầu sau thời gian chuẩn bị của cửa hàng
+  function deliverySlots() {
+    const start = new Date(Date.now() + shop.prep_minutes * 60000);
+    start.setSeconds(0, 0);
+    start.setMinutes(Math.ceil(start.getMinutes() / 30) * 30);
+    const end = new Date();
+    end.setDate(end.getDate() + 1);
+    end.setHours(21, 0, 0, 0);
+    const groups = new Map();
+    for (let t = new Date(start); t <= end; t = new Date(t.getTime() + 30 * 60000)) {
+      const hr = t.getHours() + t.getMinutes() / 60;
+      if (hr < 6 || hr > 21) continue;
+      const day = t.toLocaleDateString('vi-VN', { weekday: 'long', day: '2-digit', month: '2-digit' });
+      if (!groups.has(day)) groups.set(day, []);
+      groups.get(day).push(t);
+    }
+    return groups;
+  }
 
   function renderCart() {
     const box = $('#cart');
@@ -74,44 +99,66 @@
     }
     saveCart();
     const lines = Object.entries(cart).map(([id, qty]) => ({ p: products.find(x => x.id === Number(id)), qty }));
-    const total = lines.reduce((s, l) => s + Math.round(l.p.price * l.qty), 0);
+    const total = lines.reduce((s, l) => s + (l.p.price === null ? 0 : Math.round(l.p.price * l.qty)), 0);
+    const pricePending = lines.some(l => l.p.price === null);
 
     const bar = $('#cartBar');
     bar.classList.toggle('d-none', !lines.length);
     bar.classList.toggle('d-flex', !!lines.length);
-    bar.replaceChildren(h('span', {}, icon('cart3'), ` ${lines.length} sản phẩm`), h('strong', {}, money(total)));
+    bar.replaceChildren(h('span', {}, icon('cart3'), ` ${lines.length} sản phẩm`), h('strong', {}, pricePending ? `Tạm tính ${money(total)}` : money(total)));
 
-    box.replaceChildren(h('h2', { class: 'h5' }, '🛒 Giỏ hàng'));
-    if (!lines.length) { box.append(h('p', { class: 'text-muted mb-0' }, 'Giỏ hàng trống')); return; }
+    box.replaceChildren(h('div', { class: 'd-flex justify-content-between align-items-center' },
+      h('h2', { class: 'h5 mb-0' }, '🛒 Giỏ hàng'),
+      lines.length > 0 && h('button', { class: 'btn btn-link btn-sm text-danger p-0', onclick: () => { cart = {}; saveCart(); renderCart(); } }, icon('trash'), ' Xoá tất cả')));
+    if (!lines.length) { box.append(h('p', { class: 'text-muted mt-2 mb-0' }, 'Giỏ hàng trống')); return; }
     for (const { p, qty } of lines) {
       const setQty = v => { v = Math.round(v * 2) / 2; if (v > 0 && v <= 99) cart[p.id] = v; else delete cart[p.id]; saveCart(); renderCart(); };
-      box.append(h('div', { class: 'd-flex justify-content-between align-items-center py-2 border-bottom' },
-        h('div', {}, h('div', { class: 'fw-semibold' }, p.name), h('small', { class: 'text-muted' }, `${money(p.price)} / ${p.unit}`)),
-        h('div', { class: 'input-group input-group-sm', style: 'width:130px' },
-          h('button', { class: 'btn btn-outline-secondary', type: 'button', onclick: () => setQty(qty - 0.5) }, '−'),
+      box.append(h('div', { class: 'd-flex justify-content-between align-items-center py-2 border-bottom gap-2' },
+        h('div', { class: 'me-auto' }, h('div', { class: 'fw-semibold' }, p.name), h('small', { class: 'text-muted' }, `${productPrice(p.price)} / ${p.unit}`)),
+        h('div', { class: 'input-group input-group-sm', style: 'width:122px' },
+          h('button', { class: 'btn btn-outline-secondary', type: 'button', 'aria-label': 'Giảm', onclick: () => setQty(qty - 0.5) }, '−'),
           h('input', { class: 'form-control text-center px-0', type: 'number', min: 0, max: 99, step: 0.5, value: qty, onchange: e => setQty(Number(e.target.value)) }),
-          h('button', { class: 'btn btn-outline-secondary', type: 'button', onclick: () => setQty(qty + 0.5) }, '+'))));
+          h('button', { class: 'btn btn-outline-secondary', type: 'button', 'aria-label': 'Tăng', onclick: () => setQty(qty + 0.5) }, '+')),
+        h('button', { class: 'btn btn-outline-danger btn-sm', type: 'button', 'aria-label': 'Xoá khỏi giỏ', onclick: () => { delete cart[p.id]; saveCart(); renderCart(); } }, icon('trash'))));
     }
-    box.append(h('div', { class: 'd-flex justify-content-between my-3 fs-5' }, h('span', {}, 'Tổng'), h('span', { class: 'price' }, money(total))));
+    box.append(h('div', { class: 'd-flex justify-content-between my-3 fs-5' }, h('span', {}, pricePending ? 'Tạm tính' : 'Tổng'), h('span', { class: 'price' }, money(total))));
+    if (pricePending) box.append(h('p', { class: 'small text-warning-emphasis' }, 'Giá liên hệ chưa tính vào tạm tính. Cửa hàng sẽ xác nhận giá sau khi đặt.'));
 
+    if (!shop.accepting_orders) { box.append(h('div', { class: 'alert alert-secondary mb-0' }, 'Cửa hàng đang tạm đóng, chưa nhận đơn mới.')); return; }
     if (!user) { box.append(h('a', { class: 'btn btn-success w-100', href: '/auth.html?next=' + encodeURIComponent(location.pathname + location.search) }, 'Đăng nhập để đặt hàng')); return; }
     if (user.role !== 'customer') { box.append(h('p', { class: 'text-muted mb-0' }, 'Chỉ tài khoản khách hàng mới đặt được hàng.')); return; }
 
+    const belowMin = total < shop.min_order;
     const err = h('div', { class: 'text-danger small my-2' });
-    const input = (name, label, attrs) => h('div', { class: 'mb-2' }, h('label', { class: 'form-label mb-1 small' }, label), h('input', { class: 'form-control', name, required: true, ...attrs }));
+    const input = (name, label, attrs) => h('div', { class: 'mb-2' }, h('label', { class: 'form-label mb-1 small' }, label),
+      h('input', { class: 'form-control', name, required: true, value: draft[name], ...attrs }));
+
+    const slots = deliverySlots();
+    const select = h('select', { class: 'form-select', name: 'deliver_at' },
+      h('option', { value: '' }, `Giao sớm nhất (~${shop.prep_minutes} phút)`),
+      [...slots].map(([day, times]) => h('optgroup', { label: day }, times.map(t => {
+        const iso = t.toISOString();
+        return h('option', { value: iso, selected: draft.deliver_at === iso }, t.toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit' }));
+      }))));
+
     const f = h('form', {},
-      input('customer_name', 'Họ tên', { maxlength: 80, value: user.name }),
-      input('phone', 'Số điện thoại', { type: 'tel', pattern: '0[0-9]{9,10}', value: user.phone }),
+      input('customer_name', 'Họ tên', { maxlength: 80 }),
+      input('phone', 'Số điện thoại', { type: 'tel', pattern: '0[0-9]{9,10}' }),
       input('address', 'Địa chỉ giao hàng', { maxlength: 250 }),
-      h('div', { class: 'mb-2' }, h('label', { class: 'form-label mb-1 small' }, 'Ghi chú'), h('textarea', { class: 'form-control', name: 'note', maxlength: 300, rows: 2 })),
+      h('div', { class: 'mb-2' }, h('label', { class: 'form-label mb-1 small' }, icon('clock'), ' Thời gian giao hàng'), select),
+      h('div', { class: 'mb-2' }, h('label', { class: 'form-label mb-1 small' }, 'Ghi chú'), h('textarea', { class: 'form-control', name: 'note', maxlength: 300, rows: 2 }, draft.note)),
       h('p', { class: 'small text-muted' }, icon('cash-coin'), ' Thanh toán khi nhận hàng (COD). Thanh toán online sẽ có sau.'),
-      err, h('button', { class: 'btn btn-success w-100', type: 'submit' }, 'Đặt hàng'));
+      belowMin && h('div', { class: 'alert alert-warning py-2 small' }, `Đơn tối thiểu ${money(shop.min_order)} tính theo sản phẩm đã có giá (còn thiếu ${money(shop.min_order - total)})`),
+      err, h('button', { class: 'btn btn-success w-100', type: 'submit', disabled: belowMin }, 'Đặt hàng'));
+    // Giữ lại nội dung đã nhập khi giỏ hàng được vẽ lại
+    f.addEventListener('input', e => { if (e.target.name in draft) draft[e.target.name] = e.target.value; });
+    f.addEventListener('change', e => { if (e.target.name in draft) draft[e.target.name] = e.target.value; });
     f.addEventListener('submit', async e => {
       e.preventDefault();
       const fd = Object.fromEntries(new FormData(f));
       try {
         await api('POST', '/api/orders', {
-          shopSlug: slug, ...fd,
+          shopSlug: slug, ...fd, deliver_at: fd.deliver_at || null,
           items: Object.entries(cart).map(([id, qty]) => ({ productId: Number(id), qty })),
         });
         cart = {}; saveCart();
@@ -126,5 +173,5 @@
 
   const socket = connectSocket();
   socket.on('connect', () => socket.emit('menu:watch', slug));
-  socket.on('product:updated', async () => { if (await load()) { renderMenu(); renderCart(); } });
+  socket.on('product:updated', async () => { if (await load()) { renderInfo(); renderMenu(); renderCart(); } });
 })();

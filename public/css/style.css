@@ -23,6 +23,25 @@ body { background: #f4f8f1; padding-bottom: 80px; -webkit-tap-highlight-color: t
 .tabs-bottom button { flex: 1; border: 0; background: none; padding: 8px 4px; font-size: .75rem; color: #6c757d; display: flex; flex-direction: column; align-items: center; min-height: 56px; }
 .tabs-bottom button i { font-size: 1.3rem; }
 .tabs-bottom button.active { color: #2e7d32; font-weight: 600; }
+.menu-categories-summary { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 16px; cursor: pointer; }
+.menu-categories-summary::after { content: '\f282'; font-family: bootstrap-icons; color: #6c757d; }
+.menu-categories[open] .menu-categories-summary::after { transform: rotate(180deg); }
+.menu-categories-body { padding: 0 16px 16px; border-top: 1px solid #e8eee5; }
+.menu-category-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 10px 0; border-bottom: 1px solid #e8eee5; }
+.menu-category-name, .menu-product-info { min-width: 0; overflow-wrap: anywhere; }
+.menu-product { padding: 12px; }
+.menu-product-main { display: flex; align-items: center; gap: 10px; }
+.menu-product-info { flex: 1; }
+.menu-product-image { width: 56px; height: 56px; flex: 0 0 56px; object-fit: cover; border-radius: 10px; }
+.menu-product-placeholder { display: flex; align-items: center; justify-content: center; background: #e8f0e2; color: #71916e; font-size: 1.4rem; }
+.menu-product-actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 10px; padding-top: 10px; border-top: 1px solid #edf1eb; }
+.menu-product-actions .btn, .menu-category-row .btn { min-width: 40px; min-height: 40px; }
+.product-form-heading { margin-bottom: 12px; font-weight: 600; color: #1b5e20; }
+#productModal .modal-content > form { display: flex; flex-direction: column; min-height: 0; }
+#productModal .modal-body { overflow-y: auto; }
+.product-stock { padding-top: 6px; }
+.product-image-url { padding-top: 4px; }
+.product-image-url summary { cursor: pointer; color: #2e7d32; margin-bottom: 8px; }
 .printonly { display: none; text-align: center; }
 @media print { .navbar, .noprint, .tabs-bottom { display: none !important; } .printonly { display: block !important; } }
 @media (min-width: 992px) { body { padding-bottom: 24px; } .cart-bar { display: none; } .cart-card { top: 72px; } }

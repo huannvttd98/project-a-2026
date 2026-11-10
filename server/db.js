@@ -40,6 +40,11 @@ CREATE TABLE IF NOT EXISTS products (
   image TEXT NOT NULL DEFAULT '',
   available INTEGER NOT NULL DEFAULT 1
 );
+CREATE TABLE IF NOT EXISTS product_images (
+  product_id INTEGER PRIMARY KEY REFERENCES products(id) ON DELETE CASCADE,
+  version TEXT NOT NULL,
+  data BLOB NOT NULL
+);
 CREATE TABLE IF NOT EXISTS orders (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   public_code TEXT NOT NULL UNIQUE,
@@ -64,7 +69,33 @@ CREATE TABLE IF NOT EXISTS order_items (
 );
 CREATE INDEX IF NOT EXISTS idx_orders_shop ON orders(shop_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_orders_customer ON orders(customer_id, created_at);
+CREATE TABLE IF NOT EXISTS categories (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  shop_id INTEGER NOT NULL REFERENCES shops(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  UNIQUE (shop_id, name)
+);
 `);
+
+function addColumn(table, col, def) {
+  if (!db.prepare(`PRAGMA table_info(${table})`).all().some(c => c.name === col)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${def}`);
+  }
+}
+addColumn('shops', 'accepting_orders', 'INTEGER NOT NULL DEFAULT 1');
+addColumn('shops', 'min_order', 'INTEGER NOT NULL DEFAULT 0');
+addColumn('shops', 'prep_minutes', 'INTEGER NOT NULL DEFAULT 30');
+addColumn('orders', 'deliver_at', 'TEXT');
+addColumn('products', 'price_pending', 'INTEGER NOT NULL DEFAULT 0 CHECK (price_pending IN (0,1))');
+addColumn('order_items', 'price_pending', 'INTEGER NOT NULL DEFAULT 0 CHECK (price_pending IN (0,1))');
+
+// Tạo danh mục cho các sản phẩm đã có (dữ liệu cũ)
+function backfillCategories() {
+  db.exec(`INSERT OR IGNORE INTO categories (shop_id,name,sort_order)
+    SELECT shop_id, category, MIN(id) FROM products GROUP BY shop_id, category`);
+}
+backfillCategories();
 
 function seed() {
   if (db.prepare('SELECT COUNT(*) c FROM users').get().c > 0) return;
@@ -93,6 +124,7 @@ function seed() {
    ['Bơ sáp', 60000, 'kg', 'Trái cây'], ['Gạo ST25', 28000, 'kg', 'Gạo & hạt'],
    ['Trứng gà ta', 4000, 'quả', 'Khác']]
     .forEach(([n, pr, un, c]) => p.run(s.lastInsertRowid, n, pr, un, c));
+  backfillCategories();
 }
 seed();
 

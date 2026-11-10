@@ -8,6 +8,7 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const bcrypt = require('bcryptjs');
 const QRCode = require('qrcode');
+const sharp = require('sharp');
 const { z } = require('zod');
 const { Server } = require('socket.io');
 const db = require('./db');
@@ -30,8 +31,6 @@ app.use(helmet({
     },
   },
 }));
-app.use(express.json({ limit: '10kb' }));
-
 const sessionMw = session({
   name: 'sid',
   secret: SESSION_SECRET,
@@ -87,8 +86,11 @@ function publicShop(s) {
   return {
     name: s.name, slug: s.slug, description: s.description, address: s.address,
     contact_phone: s.contact_phone, zalo: s.zalo, open_hours: s.open_hours, logo_url: s.logo_url,
+    accepting_orders: !!s.accepting_orders, min_order: s.min_order, prep_minutes: s.prep_minutes,
   };
 }
+
+const DEFAULT_CATEGORIES = ['Rau củ', 'Trái cây', 'Gạo & ngũ cốc', 'Khác'];
 
 function loadUser(req, res, next) {
   req.user = null;
@@ -107,6 +109,12 @@ const requireRole = (...roles) => (req, res, next) => {
   if (!roles.includes(req.user.role)) return res.status(403).json({ error: 'Không có quyền' });
   next();
 };
+
+app.use('/api/shop/products', (req, res, next) => {
+  if (!['POST', 'PUT'].includes(req.method)) return next();
+  requireRole('shop')(req, res, () => express.json({ limit: '28mb' })(req, res, next));
+});
+app.use(express.json({ limit: '10kb' }));
 
 function baseUrl(req) {
   return (process.env.PUBLIC_URL || `${req.protocol}://${req.get('host')}`).replace(/\/$/, '');
@@ -162,8 +170,10 @@ app.post('/api/auth/register', limiter(10, 15), wrap(async (req, res) => {
     const r = db.prepare('INSERT INTO users (phone,password_hash,role,name) VALUES (?,?,?,?)')
       .run(d.phone, hash, d.role, d.name);
     if (d.role === 'shop') {
-      db.prepare('INSERT INTO shops (owner_id,name,slug,contact_phone) VALUES (?,?,?,?)')
+      const sh = db.prepare('INSERT INTO shops (owner_id,name,slug,contact_phone) VALUES (?,?,?,?)')
         .run(r.lastInsertRowid, d.shopName, slugify(d.shopName), d.phone);
+      const insCat = db.prepare('INSERT INTO categories (shop_id,name,sort_order) VALUES (?,?,?)');
+      DEFAULT_CATEGORIES.forEach((c, i) => insCat.run(sh.lastInsertRowid, c, i));
     }
     return r.lastInsertRowid;
   })();
@@ -174,7 +184,8 @@ app.post('/api/auth/register', limiter(10, 15), wrap(async (req, res) => {
 }));
 
 app.post('/api/auth/login', limiter(10, 15), wrap(async (req, res) => {
-  const d = validate(z.object({ phone: phoneSchema, password: z.string().max(100) }), req.body);
+  const loginPhone = z.preprocess(value => typeof value === 'string' ? value.replace(/\s/g, '') : value, phoneSchema);
+  const d = validate(z.object({ phone: loginPhone, password: z.string().max(100) }), req.body);
   const row = db.prepare('SELECT * FROM users WHERE phone=?').get(d.phone);
   const ok = await bcrypt.compare(d.password, row ? row.password_hash : DUMMY_HASH);
   if (!row || !ok) throw fail(401, 'Sai số điện thoại hoặc mật khẩu');
@@ -199,8 +210,9 @@ app.get('/api/shops', (req, res) => {
 app.get('/api/shops/:slug', (req, res) => {
   const s = db.prepare("SELECT * FROM shops WHERE slug=? AND status='approved'").get(req.params.slug);
   if (!s) return res.status(404).json({ error: 'Không tìm thấy cửa hàng' });
-  const products = db.prepare('SELECT id,name,price,unit,category,image,available FROM products WHERE shop_id=? ORDER BY category,name').all(s.id);
-  res.json({ shop: publicShop(s), products });
+  const products = db.prepare('SELECT id,name,price,price_pending,unit,category,image,available FROM products WHERE shop_id=? ORDER BY name').all(s.id).map(productDto);
+  const categories = db.prepare('SELECT name FROM categories WHERE shop_id=? ORDER BY sort_order,id').all(s.id).map(c => c.name);
+  res.json({ shop: publicShop(s), products, categories });
 });
 
 function sendQr(req, res, shop) {
@@ -233,12 +245,14 @@ const TRANSITIONS = {
 };
 
 function orderDto(o) {
-  const items = db.prepare('SELECT product_id,name,price,qty FROM order_items WHERE order_id=?').all(o.id);
+  const items = db.prepare('SELECT id,product_id,name,price,qty,price_pending FROM order_items WHERE order_id=?').all(o.id)
+    .map(i => ({ ...i, price: i.price_pending ? null : i.price }));
   const shop = db.prepare('SELECT name,slug FROM shops WHERE id=?').get(o.shop_id);
   return {
-    code: o.public_code, status: o.status, total: o.total, created_at: o.created_at,
+    code: o.public_code, status: o.status, total: o.total, created_at: o.created_at, deliver_at: o.deliver_at,
     customer_name: o.customer_name, phone: o.phone, address: o.address, note: o.note,
-    payment_method: o.payment_method, shop: shop && { name: shop.name, slug: shop.slug }, items,
+    payment_method: o.payment_method, shop: shop && { name: shop.name, slug: shop.slug },
+    price_pending: items.some(i => i.price_pending), items,
   };
 }
 
@@ -248,6 +262,7 @@ const orderSchema = z.object({
   phone: phoneSchema,
   address: str(250),
   note: z.string().trim().max(300).default(''),
+  deliver_at: z.string().max(40).nullable().optional(),
   items: z.array(z.object({
     productId: z.number().int().positive(),
     qty: z.number().min(0.5).max(99).refine(v => Number.isInteger(v * 2), 'Số lượng phải là bội của 0.5'),
@@ -258,6 +273,18 @@ app.post('/api/orders', requireRole('customer'), limiter(20, 10), wrap(async (re
   const d = validate(orderSchema, req.body);
   const shop = db.prepare("SELECT * FROM shops WHERE slug=? AND status='approved'").get(d.shopSlug);
   if (!shop) throw fail(404, 'Cửa hàng không tồn tại hoặc tạm ngưng');
+  if (!shop.accepting_orders) throw fail(409, 'Cửa hàng đang tạm đóng, chưa nhận đơn');
+
+  // Giờ giao hàng: để trống = giao sớm nhất; nếu chọn phải sau thời gian chuẩn bị của cửa hàng
+  let deliverAt = null;
+  if (d.deliver_at) {
+    const t = Date.parse(d.deliver_at);
+    const now = Date.now();
+    if (Number.isNaN(t) || t < now + Math.max(0, shop.prep_minutes - 2) * 60000 || t > now + 3 * 86400000) {
+      throw fail(400, `Giờ giao không hợp lệ (cần sau ít nhất ${shop.prep_minutes} phút kể từ bây giờ, tối đa 3 ngày)`);
+    }
+    deliverAt = new Date(t).toISOString();
+  }
 
   const merged = new Map();
   for (const it of d.items) merged.set(it.productId, (merged.get(it.productId) || 0) + it.qty);
@@ -270,13 +297,14 @@ app.post('/api/orders', requireRole('customer'), limiter(20, 10), wrap(async (re
       const p = db.prepare('SELECT * FROM products WHERE id=? AND shop_id=?').get(pid, shop.id);
       if (!p || !p.available) throw fail(400, `Sản phẩm không còn bán (#${pid})`);
       if (qty > 99) throw fail(400, 'Số lượng quá lớn');
-      total += Math.round(p.price * qty);
+      if (!p.price_pending) total += Math.round(p.price * qty);
       lines.push([p, qty]);
     }
-    const r = db.prepare(`INSERT INTO orders (public_code,shop_id,customer_id,customer_name,phone,address,note,total)
-      VALUES (?,?,?,?,?,?,?,?)`).run(code, shop.id, req.user.id, d.customer_name, d.phone, d.address, d.note, total);
-    const ins = db.prepare('INSERT INTO order_items (order_id,product_id,name,price,qty) VALUES (?,?,?,?,?)');
-    for (const [p, qty] of lines) ins.run(r.lastInsertRowid, p.id, p.name, p.price, qty);
+    if (total < shop.min_order) throw fail(400, `Đơn tối thiểu của cửa hàng là ${shop.min_order.toLocaleString('vi-VN')}đ`);
+    const r = db.prepare(`INSERT INTO orders (public_code,shop_id,customer_id,customer_name,phone,address,note,total,deliver_at)
+      VALUES (?,?,?,?,?,?,?,?,?)`).run(code, shop.id, req.user.id, d.customer_name, d.phone, d.address, d.note, total, deliverAt);
+    const ins = db.prepare('INSERT INTO order_items (order_id,product_id,name,price,qty,price_pending) VALUES (?,?,?,?,?,?)');
+    for (const [p, qty] of lines) ins.run(r.lastInsertRowid, p.id, p.name, p.price, qty, p.price_pending);
     return r.lastInsertRowid;
   })();
 
@@ -298,6 +326,9 @@ app.get('/api/orders/:code', requireRole('customer'), (req, res) => {
 
 function changeStatus(order, next) {
   if (!TRANSITIONS[order.status].includes(next)) throw fail(409, 'Không thể chuyển trạng thái này');
+  if (next !== 'cancelled' && db.prepare('SELECT 1 FROM order_items WHERE order_id=? AND price_pending=1').get(order.id)) {
+    throw fail(409, 'Vui lòng xác nhận giá sản phẩm trước khi xử lý đơn');
+  }
   const r = db.prepare('UPDATE orders SET status=? WHERE id=? AND status=?').run(next, order.id, order.status);
   if (!r.changes) throw fail(409, 'Đơn đã được cập nhật, vui lòng tải lại');
   const dto = orderDto(db.prepare('SELECT * FROM orders WHERE id=?').get(order.id));
@@ -320,6 +351,8 @@ const shopOnly = [requireRole('shop'), (req, res, next) => {
   next();
 }];
 
+const notifyMenu = shop => io.to(`menu:${shop.slug}`).emit('product:updated');
+
 app.get('/api/shop/profile', shopOnly, (req, res) => res.json({ ...publicShop(req.shop), status: req.shop.status }));
 
 app.put('/api/shop/profile', shopOnly, (req, res) => {
@@ -328,41 +361,152 @@ app.put('/api/shop/profile', shopOnly, (req, res) => {
     contact_phone: z.string().trim().max(20).regex(/^(\d{9,11})?$/, 'SĐT liên hệ không hợp lệ'),
     zalo: z.string().trim().max(20).regex(/^(\d{9,11})?$/, 'Số Zalo không hợp lệ'),
     open_hours: z.string().trim().max(60), logo_url: httpsUrl,
+    accepting_orders: z.boolean(),
+    min_order: z.number().int().min(0).max(1e8),
+    prep_minutes: z.number().int().min(0).max(600),
   }), req.body);
-  db.prepare(`UPDATE shops SET name=?,description=?,address=?,contact_phone=?,zalo=?,open_hours=?,logo_url=? WHERE id=?`)
-    .run(d.name, d.description, d.address, d.contact_phone, d.zalo, d.open_hours, d.logo_url, req.shop.id);
+  db.prepare(`UPDATE shops SET name=?,description=?,address=?,contact_phone=?,zalo=?,open_hours=?,logo_url=?,
+    accepting_orders=?,min_order=?,prep_minutes=? WHERE id=?`)
+    .run(d.name, d.description, d.address, d.contact_phone, d.zalo, d.open_hours, d.logo_url,
+      d.accepting_orders ? 1 : 0, d.min_order, d.prep_minutes, req.shop.id);
+  notifyMenu(req.shop);
   res.json({ ok: true });
 });
 
 app.get('/api/shop/qr', shopOnly, wrap(async (req, res) => { await sendQr(req, res, req.shop); }));
 
-const productSchema = z.object({
-  name: str(100), price: z.number().int().min(0).max(1e9), unit: str(20),
-  category: str(40), image: httpsUrl.default(''), available: z.boolean(),
+// ----- Danh mục menu -----
+const catName = str(40);
+const listCategories = shopId => db.prepare(`SELECT c.id,c.name,
+  (SELECT COUNT(*) FROM products p WHERE p.shop_id=c.shop_id AND p.category=c.name) AS products
+  FROM categories c WHERE c.shop_id=? ORDER BY c.sort_order,c.id`).all(shopId);
+
+app.get('/api/shop/categories', shopOnly, (req, res) => res.json(listCategories(req.shop.id)));
+
+app.post('/api/shop/categories', shopOnly, (req, res) => {
+  const { name } = validate(z.object({ name: catName }), req.body);
+  if (db.prepare('SELECT 1 FROM categories WHERE shop_id=? AND name=?').get(req.shop.id, name)) throw fail(409, 'Danh mục đã tồn tại');
+  const max = db.prepare('SELECT COALESCE(MAX(sort_order),0) m FROM categories WHERE shop_id=?').get(req.shop.id).m;
+  db.prepare('INSERT INTO categories (shop_id,name,sort_order) VALUES (?,?,?)').run(req.shop.id, name, max + 1);
+  notifyMenu(req.shop);
+  res.status(201).json(listCategories(req.shop.id));
 });
+
+app.post('/api/shop/categories/reorder', shopOnly, (req, res) => {
+  const { ids } = validate(z.object({ ids: z.array(z.number().int()).max(200) }), req.body);
+  const upd = db.prepare('UPDATE categories SET sort_order=? WHERE id=? AND shop_id=?');
+  db.transaction(() => ids.forEach((id, i) => upd.run(i, id, req.shop.id)))();
+  notifyMenu(req.shop);
+  res.json(listCategories(req.shop.id));
+});
+
+app.put('/api/shop/categories/:id', shopOnly, (req, res) => {
+  const { name } = validate(z.object({ name: catName }), req.body);
+  const cat = db.prepare('SELECT * FROM categories WHERE id=? AND shop_id=?').get(Number(req.params.id), req.shop.id);
+  if (!cat) throw fail(404, 'Không tìm thấy danh mục');
+  if (name !== cat.name && db.prepare('SELECT 1 FROM categories WHERE shop_id=? AND name=?').get(req.shop.id, name)) throw fail(409, 'Danh mục đã tồn tại');
+  db.transaction(() => {
+    db.prepare('UPDATE categories SET name=? WHERE id=?').run(name, cat.id);
+    db.prepare('UPDATE products SET category=? WHERE shop_id=? AND category=?').run(name, req.shop.id, cat.name);
+  })();
+  notifyMenu(req.shop);
+  res.json(listCategories(req.shop.id));
+});
+
+app.delete('/api/shop/categories/:id', shopOnly, (req, res) => {
+  const cat = db.prepare('SELECT * FROM categories WHERE id=? AND shop_id=?').get(Number(req.params.id), req.shop.id);
+  if (!cat) throw fail(404, 'Không tìm thấy danh mục');
+  if (db.prepare('SELECT 1 FROM products WHERE shop_id=? AND category=?').get(req.shop.id, cat.name)) {
+    throw fail(409, 'Danh mục còn sản phẩm, hãy chuyển hoặc xoá sản phẩm trước');
+  }
+  db.prepare('DELETE FROM categories WHERE id=?').run(cat.id);
+  notifyMenu(req.shop);
+  res.json(listCategories(req.shop.id));
+});
+
+// ----- Sản phẩm -----
+const productSchema = z.object({
+  name: str(100), price: z.number().int().min(0).max(1e9).nullable(), unit: str(20),
+  category: str(40), image: z.string().max(500).default(''),
+  imageData: z.string().max(28 * 1024 * 1024).optional(), available: z.boolean(),
+});
+
+const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+async function processProductImage(data) {
+  const match = /^data:image\/(?:jpeg|png|webp);base64,([A-Za-z0-9+/]+={0,2})$/.exec(data);
+  if (!match) throw fail(400, 'Ảnh phải là JPEG, PNG hoặc WebP hợp lệ');
+  const input = Buffer.from(match[1], 'base64');
+  if (input.length > MAX_IMAGE_BYTES) throw fail(400, 'Ảnh không được lớn hơn 20 MB');
+  try {
+    const image = sharp(input, { limitInputPixels: 40000000, animated: false });
+    const metadata = await image.metadata();
+    if (!['jpeg', 'png', 'webp'].includes(metadata.format)) throw fail(400, 'Ảnh phải là JPEG, PNG hoặc WebP hợp lệ');
+    return await image.resize({ width: 1600, height: 1600, fit: 'inside', withoutEnlargement: true }).webp({ quality: 85 }).toBuffer();
+  } catch (err) {
+    if (err.status) throw err;
+    throw fail(400, 'Không thể đọc ảnh. Hãy chọn ảnh JPEG, PNG hoặc WebP hợp lệ, tối đa 40 megapixel');
+  }
+}
+
+app.get('/api/product-images/:id/:version', (req, res) => {
+  const image = db.prepare('SELECT data FROM product_images WHERE product_id=? AND version=?')
+    .get(Number(req.params.id), req.params.version);
+  if (!image) return res.status(404).json({ error: 'Không tìm thấy ảnh' });
+  res.set('Cache-Control', 'no-store').type('image/webp').send(image.data);
+});
+
+function checkCategory(shop, name) {
+  if (!db.prepare('SELECT 1 FROM categories WHERE shop_id=? AND name=?').get(shop.id, name)) throw fail(400, 'Danh mục không tồn tại');
+}
+
+function productDto(p) {
+  const { price_pending, ...product } = p;
+  return { ...product, price: price_pending ? null : p.price };
+}
 
 app.get('/api/shop/products', shopOnly, (req, res) => {
-  res.json(db.prepare('SELECT * FROM products WHERE shop_id=? ORDER BY category,name').all(req.shop.id));
+  res.json(db.prepare('SELECT * FROM products WHERE shop_id=? ORDER BY name').all(req.shop.id).map(productDto));
 });
 
-const notifyMenu = shop => io.to(`menu:${shop.slug}`).emit('product:updated');
-
-app.post('/api/shop/products', shopOnly, (req, res) => {
+app.post('/api/shop/products', shopOnly, wrap(async (req, res) => {
   const d = validate(productSchema, req.body);
-  const r = db.prepare('INSERT INTO products (shop_id,name,price,unit,category,image,available) VALUES (?,?,?,?,?,?,?)')
-    .run(req.shop.id, d.name, d.price, d.unit, d.category, d.image, d.available ? 1 : 0);
+  checkCategory(req.shop, d.category);
+  validate(httpsUrl, d.image);
+  const imageData = d.imageData ? await processProductImage(d.imageData) : null;
+  const r = db.transaction(() => {
+    const result = db.prepare('INSERT INTO products (shop_id,name,price,unit,category,image,available,price_pending) VALUES (?,?,?,?,?,?,?,?)')
+      .run(req.shop.id, d.name, d.price ?? 0, d.unit, d.category, d.image, d.available ? 1 : 0, d.price === null ? 1 : 0);
+    if (imageData) saveProductImage(result.lastInsertRowid, imageData);
+    return result;
+  })();
   notifyMenu(req.shop);
   res.status(201).json({ id: r.lastInsertRowid });
-});
+}));
 
-app.put('/api/shop/products/:id', shopOnly, (req, res) => {
+function saveProductImage(id, data) {
+  const version = crypto.randomBytes(12).toString('hex');
+  db.prepare('INSERT OR REPLACE INTO product_images (product_id,version,data) VALUES (?,?,?)').run(id, version, data);
+  db.prepare('UPDATE products SET image=? WHERE id=?').run(`/api/product-images/${id}/${version}`, id);
+}
+
+app.put('/api/shop/products/:id', shopOnly, wrap(async (req, res) => {
   const d = validate(productSchema, req.body);
-  const r = db.prepare('UPDATE products SET name=?,price=?,unit=?,category=?,image=?,available=? WHERE id=? AND shop_id=?')
-    .run(d.name, d.price, d.unit, d.category, d.image, d.available ? 1 : 0, Number(req.params.id), req.shop.id);
-  if (!r.changes) return res.status(404).json({ error: 'Không tìm thấy sản phẩm' });
+  checkCategory(req.shop, d.category);
+  const id = Number(req.params.id);
+  const existing = db.prepare('SELECT image FROM products WHERE id=? AND shop_id=?').get(id, req.shop.id);
+  if (!existing) return res.status(404).json({ error: 'Không tìm thấy sản phẩm' });
+  if (d.image !== existing.image || !d.image.startsWith('/api/product-images/')) validate(httpsUrl, d.image);
+  const imageData = d.imageData ? await processProductImage(d.imageData) : null;
+  db.transaction(() => {
+    const r = db.prepare('UPDATE products SET name=?,price=?,unit=?,category=?,image=?,available=?,price_pending=? WHERE id=? AND shop_id=?')
+      .run(d.name, d.price ?? 0, d.unit, d.category, d.image, d.available ? 1 : 0, d.price === null ? 1 : 0, id, req.shop.id);
+    if (!r.changes) throw fail(404, 'Không tìm thấy sản phẩm');
+    if (imageData) saveProductImage(id, imageData);
+    else if (d.image !== existing.image) db.prepare('DELETE FROM product_images WHERE product_id=?').run(id);
+  })();
   notifyMenu(req.shop);
   res.json({ ok: true });
-});
+}));
 
 app.delete('/api/shop/products/:id', shopOnly, (req, res) => {
   const r = db.prepare('DELETE FROM products WHERE id=? AND shop_id=?').run(Number(req.params.id), req.shop.id);
@@ -371,9 +515,54 @@ app.delete('/api/shop/products/:id', shopOnly, (req, res) => {
   res.json({ ok: true });
 });
 
+app.get('/api/shop/stats', shopOnly, (req, res) => {
+  const { range } = validate(z.object({ range: z.enum(['24h', '7d', '30d', 'all']).default('7d') }), req.query);
+  const since = { '24h': '-1 days', '7d': '-7 days', '30d': '-30 days', all: null }[range];
+  const cond = since ? "AND created_at >= datetime('now', ?)" : '';
+  const args = since ? [req.shop.id, since] : [req.shop.id];
+  const counts = { new: 0, preparing: 0, delivering: 0, done: 0, cancelled: 0 };
+  for (const r of db.prepare(`SELECT status, COUNT(*) n FROM orders WHERE shop_id=? ${cond} GROUP BY status`).all(...args)) counts[r.status] = r.n;
+  const total = Object.values(counts).reduce((a, b) => a + b, 0);
+  const revenue = db.prepare(`SELECT COALESCE(SUM(total),0) s FROM orders WHERE shop_id=? AND status='done' ${cond}`).get(...args).s;
+  const top = db.prepare(`SELECT i.name, SUM(i.qty) qty, SUM(ROUND(i.price*i.qty)) revenue
+    FROM order_items i JOIN orders o ON o.id=i.order_id
+    WHERE o.shop_id=? AND o.status='done' ${since ? "AND o.created_at >= datetime('now', ?)" : ''}
+    GROUP BY i.product_id, i.name ORDER BY revenue DESC LIMIT 5`).all(...args);
+  res.json({
+    range, total, counts, revenue,
+    avg: counts.done ? Math.round(revenue / counts.done) : 0,
+    cancelRate: total ? Math.round((counts.cancelled / total) * 100) : 0,
+    top,
+  });
+});
+
 app.get('/api/shop/orders', shopOnly, (req, res) => {
   const rows = db.prepare('SELECT * FROM orders WHERE shop_id=? ORDER BY id DESC LIMIT 200').all(req.shop.id);
   res.json(rows.map(orderDto));
+});
+
+app.put('/api/shop/orders/:code/prices', shopOnly, (req, res) => {
+  const d = validate(z.object({
+    items: z.array(z.object({ id: z.number().int().positive(), price: z.number().int().min(0).max(1e9) })).min(1).max(30),
+  }), req.body);
+  const dto = db.transaction(() => {
+    const order = db.prepare('SELECT * FROM orders WHERE public_code=? AND shop_id=?').get(req.params.code, req.shop.id);
+    if (!order) throw fail(404, 'Không tìm thấy đơn hàng');
+    if (order.status !== 'new') throw fail(409, 'Chỉ xác nhận giá khi đơn còn mới');
+    const pending = db.prepare('SELECT id FROM order_items WHERE order_id=? AND price_pending=1').all(order.id);
+    const prices = new Map(d.items.map(item => [item.id, item.price]));
+    if (!pending.length || prices.size !== d.items.length || pending.length !== prices.size || pending.some(item => !prices.has(item.id))) {
+      throw fail(409, 'Danh sách giá không còn hợp lệ, vui lòng tải lại đơn hàng');
+    }
+    const update = db.prepare('UPDATE order_items SET price=?,price_pending=0 WHERE id=? AND order_id=?');
+    for (const item of pending) update.run(prices.get(item.id), item.id, order.id);
+    const total = db.prepare('SELECT COALESCE(SUM(ROUND(price * qty)),0) AS total FROM order_items WHERE order_id=?').get(order.id).total;
+    db.prepare('UPDATE orders SET total=? WHERE id=?').run(total, order.id);
+    return { dto: orderDto({ ...order, total }), customerId: order.customer_id };
+  })();
+  io.to(`user:${dto.customerId}`).emit('order:updated', { code: dto.dto.code });
+  io.to(`shop:${req.shop.id}`).emit('order:updated', { code: dto.dto.code });
+  res.json(dto.dto);
 });
 
 app.patch('/api/shop/orders/:code/status', shopOnly, (req, res) => {
